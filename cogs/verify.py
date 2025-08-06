@@ -50,17 +50,36 @@ class CodeModal(discord.ui.Modal, title="認証コードの入力"):
             if guild and member:
                 role = guild.get_role(role_id)
                 if role:
-                    await member.add_roles(role)
-                    self.cog.verify_codes.pop(self.user.id, None)
-                    await interaction.response.send_message(f"<:check:1394240622310850580>認証しました。", ephemeral=True)
-                    return
-
-            await interaction.response.send_message("<:warn:1394241229176311888> サーバーまたはロール情報に問題があります。", ephemeral=True)
+                    try:
+                        await member.add_roles(role, reason="認証成功")
+                        self.cog.verify_codes.pop(self.user.id, None)
+                        await interaction.response.send_message(
+                            f"<:check:1394240622310850580> 認証しました。",
+                            ephemeral=True
+                        )
+                        return
+                    except discord.Forbidden:
+                        await interaction.response.send_message(
+                            f"<:warn:1394241229176311888> 認証には成功しましたが、ロールを付与できませんでした。\n"
+                            f"→ botのロールが `{role.name}` より上にあるか確認してください。",
+                            ephemeral=True
+                        )
+                        return
+                    except Exception as e:
+                        await interaction.response.send_message(
+                            f"<:warn:1394241229176311888> ロールの付与中に予期せぬエラーが発生しました。\n```{type(e).__name__}: {e}```",
+                            ephemeral=True
+                        )
+                        return
+            await interaction.response.send_message(
+                "<:warn:1394241229176311888> サーバーまたはロール情報に問題があります。",
+                ephemeral=True
+            )
         else:
             # 認証失敗 → タイムアウト処理（1分）
             if member:
                 try:
-                    await member.timeout(discord.utils.utcnow() + timedelta(minutes=10), reason="認証失敗")
+                    await member.timeout(discord.utils.utcnow() + timedelta(minutes=1), reason="認証失敗")
                     await interaction.response.send_message(
                         f"<:cross:1394240624202481705>認証に失敗しました。\n1分後にやり直してください。",
                         ephemeral=True
@@ -84,25 +103,32 @@ class CodeInputButton(discord.ui.Button):
 
     async def callback(self, interaction: discord.Interaction):
         if interaction.user.id != self.user.id:
-            await interaction.response.send_message(f"<:cross:1394240624202481705>このボタンはあなた専用です。", ephemeral=True)
+            await interaction.response.send_message("このボタンはあなた専用です。", ephemeral=True)
             return
         await interaction.response.send_modal(CodeModal(self.cog, self.user))
 
 class VerifyStartButton(discord.ui.Button):
-    def __init__(self, cog):
-        super().__init__(label="認証", style=discord.ButtonStyle.primary)
+    def __init__(self, cog, panel_name: str):
+        super().__init__(
+            label="認証",
+            style=discord.ButtonStyle.primary,
+            custom_id=f"persistent_verify_button:{panel_name}"
+        )
         self.cog = cog
+        self.panel_name = panel_name
 
     async def callback(self, interaction: discord.Interaction):
         user = interaction.user
         guild = interaction.guild
         guild_id = str(guild.id)
+        panel_name = self.panel_name
+
         roles = load_roles()
-        role_id = roles.get(guild_id)
+        role_id = roles.get(guild_id, {}).get(panel_name)
 
         if role_id is None:
             await interaction.response.send_message(
-                f"<:warn:1394241229176311888>認証ロールが設定されていません。管理者に設定してください。",
+                f"<:warn:1394241229176311888>このパネルにはロールが設定されていません。",
                 ephemeral=True
             )
             return
@@ -115,10 +141,7 @@ class VerifyStartButton(discord.ui.Button):
             )
             return
 
-        # 認証コード生成
         code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=5))
-
-        # 画像作成
         image = Image.new("RGB", (220, 100), (255, 255, 255))
         draw = ImageDraw.Draw(image)
         try:
@@ -143,47 +166,63 @@ class VerifyStartButton(discord.ui.Button):
 
         self.cog.verify_codes[user.id] = (code, guild.id, role_id)
 
-        # コード入力ボタン
         view = discord.ui.View()
         view.add_item(CodeInputButton(self.cog, user))
 
         file = discord.File(buffer, filename="captcha.png")
         await interaction.response.send_message(
-            content=f"以下の画像を見て、`コードを入力` ボタンから認証してください。",
+            content=f"この文字を読み取って記入してください。",
             file=file,
             view=view,
             ephemeral=True
         )
 
+class VerifyView(discord.ui.View):
+    def __init__(self, cog, panel_name: str):
+        super().__init__(timeout=None)
+        self.add_item(VerifyStartButton(cog, panel_name))
+
 class VerifyCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        self.verify_codes = {}  # user_id: (code, guild_id, role_id)
+        self.verify_codes = {}
 
-    @commands.hybrid_command(name="verify", with_app_command=True, description="認証ロール設定または認証パネル送信")
-    @commands.has_permissions(administrator=True)
-    async def verify(self, ctx: commands.Context, role: discord.Role = None):
+        # 永続ビューの復元（起動時）
         roles = load_roles()
+        for guild_id, panels in roles.items():
+            for panel_name in panels:
+                bot.add_view(VerifyView(self, panel_name))
+
+    @commands.hybrid_command(name="verify", description="認証ロールを設定または認証パネルを送信します。")
+    @commands.has_permissions(administrator=True)
+    async def verify(self, ctx: commands.Context, panel_name: str, role: discord.Role = None):
         guild_id = str(ctx.guild.id)
+        roles = load_roles()
+
         if role is not None:
-            roles[guild_id] = role.id
+            if guild_id not in roles:
+                roles[guild_id] = {}
+            roles[guild_id][panel_name] = role.id
             save_roles(roles)
-            await ctx.send(f"<:check:1394240622310850580>認証ロールを `{role.name}` に設定しました。", ephemeral=True)
+            await ctx.send(f"<:check:1394240622310850580> パネル `{panel_name}` にロール `{role.name}` を設定しました。", ephemeral=True)
         else:
-            role_id = roles.get(guild_id)
+            role_id = roles.get(guild_id, {}).get(panel_name)
             if role_id is None:
-                await ctx.send(f"<:warn:1394241229176311888> 認証ロールが設定されていません。`/verify @ロール名` で設定してください。", ephemeral=True)
+                await ctx.send(f"<:warn:1394241229176311888> パネル `{panel_name}` にロールが設定されていません。", ephemeral=True)
                 return
+
             embed = discord.Embed(
-                description=f"<@&{role_id}>をもらうには認証してください。",
+                description=f"<@&{role_id}> をもらうには認証してください。",
                 color=discord.Color.green()
             )
-            view = discord.ui.View()
-            view.add_item(VerifyStartButton(self))  # Cogを渡す
+            view = VerifyView(self, panel_name)
             await ctx.send(embed=embed, view=view)
+
     @verify.error
     async def verify_error(self, ctx, error):
         if isinstance(error, commands.MissingPermissions):
-            await ctx.send(f"<:cross:1394240624202481705>このコマンドを実行するには管理者権限が必要です。", ephemeral=True)
+            await ctx.send(f"<:cross:1394240624202481705> このコマンドを使うには管理者権限が必要です。", ephemeral=True)
+
 async def setup(bot):
-    await bot.add_cog(VerifyCog(bot))
+    cog = VerifyCog(bot)
+    await bot.add_cog(cog)
