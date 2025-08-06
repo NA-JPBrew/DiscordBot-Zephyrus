@@ -1,15 +1,18 @@
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 import os
 import json
 import sys
 import subprocess
+import asyncio
 
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True
 intents.guilds = True
+intents.presences = True
 
-bot = commands.Bot(command_prefix="z!", intents=intents, help_command=None)
+bot = commands.AutoShardedBot(command_prefix="zd!", intents=intents, help_command=None)
 
 # ===== 許可するユーザーID =====
 ALLOWED_USER_IDS = [
@@ -27,6 +30,16 @@ def is_owner_user():
 @bot.event
 async def on_ready():
     print(f"Bot is ready. Logged in as {bot.user} (ID: {bot.user.id})")
+    bot.loop.create_task(status_task())
+
+async def status_task():
+    total_guilds = len(bot.guilds)
+    total_users = sum(g.member_count for g in bot.guilds if g.member_count)
+    while True:
+        for shard_id in range(bot.shard_count):
+            activity = discord.Game(name=f"{total_guilds}サーバー | {total_users}ユーザー | シャード{shard_id + 1}/{bot.shard_count}")
+            await bot.change_presence(status=discord.Status.online, activity=activity)
+            await asyncio.sleep(15)  # 15秒ごとに表示を切り替え
 
 @bot.event
 async def setup_hook():
@@ -34,7 +47,6 @@ async def setup_hook():
         if filename.endswith('.py'):
             await bot.load_extension(f'cogs.{filename[:-3]}')
             print(f"Loaded cog: {filename}")
-
 
     # スラッシュコマンドを同期
     await bot.tree.sync()
@@ -94,6 +106,15 @@ async def restart_bot(ctx):
     subprocess.Popen([sys.executable] + sys.argv)
     # 注意: subprocess の直後に return しないと二重起動になる可能性あり
     return
+
+@bot.command(name="sync")
+@is_owner_user()
+async def sync_commands(ctx: commands.Context):
+    try:
+        synced = await bot.tree.sync()
+        await ctx.send(f"Synced {len(synced)} command(s)!")
+    except Exception as e:
+        await ctx.send(f"Error while syncing command: `{e}`")
 
 # ===== 権限エラー時のメッセージ =====
 @load_cog.error
